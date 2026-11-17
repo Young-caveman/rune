@@ -17,6 +17,22 @@ impl El {
         self.cold_mut().growth = Some(Box::new(spec));
         self
     }
+    /// Rounds each in-flow child's height on a non-wrapping flex column to a whole point
+    /// (`(h + 0.5).floor()`, matching `Math.round`), inside Taffy's flexbox solver, as TanStack
+    /// Virtual's `measureElement` returning `Math.round(borderBoxSize.blockSize)` places OpenCode
+    /// Desktop's timeline rows (`app/src/session/timeline/virtualizer.tsx:362,370,1081`). Padding
+    /// and gaps keep their exact values, and Taffy computes the container's own box, wrappers,
+    /// siblings, scroll extents, centring, `flex_grow`, and out-of-flow or anchored children from
+    /// the rounded item heights in the same layout pass. With a whole top, padding and gap, every
+    /// row's top, stored virtual heights and the list's extent are whole points (whole CSS px) at
+    /// any scale. Non-column or wrapping containers ignore the flag (with a debug warning), and
+    /// `Display::None` or out-of-flow children are skipped. A child's content keeps its own layout
+    /// from the child's top, so up to half a point hangs below its box or is left empty. Off by
+    /// default.
+    pub fn whole_rows(mut self) -> Self {
+        self.style.set_whole_rows();
+        self
+    }
     /// A growth-stack row that is streaming: slows near its target and reveals through the
     /// feathered edge.
     pub fn streaming(mut self, on: bool) -> Self {
