@@ -331,6 +331,9 @@ impl<S: 'static> Running<S> {
         match event {
             WindowEvent::ModifiersChanged(mods) => { self.input.mods = mods.state(); return false; }
             WindowEvent::CursorMoved { position, .. } if !self.rt.touching() => {
+                // Device pixels to view points, as the native host does: the window's scale
+                // times the UI zoom (`Cx::zoom`), or a zoomed view hit-tests unzoomed.
+                let scale = self.rt.input_scale();
                 self.rt.pointer_move(position.x as f32 / scale, position.y as f32 / scale);
                 self.cursor.apply(window, self.rt.cursor(), true);
             }
