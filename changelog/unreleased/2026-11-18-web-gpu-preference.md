@@ -1,0 +1,1 @@
+- Web apps use the browser's default GPU preference and try a high-performance adapter once if the WebGPU device is lost during the CPU-to-GPU handover.

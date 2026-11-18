@@ -135,7 +135,7 @@ fn spawn<S: 'static>(mut app: App<S>) -> Result<(), String> {
     page::occupy(quitting(&shared), app.same_tab_router.take());
     event_loop.spawn_app(Browser { app: Some(app), shared, proxy, window: None, embedded: false, document: false, owns_canvas: true,
         borrowed: page::Borrowed::default(), start: Start::GpuFirst, fonts: Rc::default(), pending: Rc::default(), warmed: Rc::default(), running: Rc::default(),
-        lost: Rc::default(), waiting: None, first_at: None, drawn_at: None, gpu_asked: false });
+        lost: Rc::default(), waiting: None, first_at: None, drawn_at: None, gpu_attempt: None });
     Ok(())
 }
 
@@ -166,11 +166,11 @@ struct Browser<S: 'static> {
     /// isn't set again.
     waiting: Option<u64>,
     /// For a page that starts on the CPU: when its first frame was presented, when it last drew
-    /// one that changed more than an ambient loop (a spinner's step), and whether the GPU was
-    /// asked for.
+    /// one that changed more than an ambient loop (a spinner's step).
     first_at: Option<Instant>,
     drawn_at: Option<Instant>,
-    gpu_asked: bool,
+    /// The preference sent to the browser, or no request yet.
+    gpu_attempt: Option<wgpu::PowerPreference>,
 }
 
 /// The GPU's side of the page: its device, the canvas's surface and Rune's renderer.
@@ -384,14 +384,14 @@ fn error(message: &str, target: Option<&web_sys::HtmlCanvasElement>, embedded: b
     }
 }
 
-async fn try_backend(canvas: &web_sys::HtmlCanvasElement, backends: wgpu::Backends, features: wgpu::Features, webgl: bool)
+async fn try_backend(canvas: &web_sys::HtmlCanvasElement, backends: wgpu::Backends, features: wgpu::Features, preference: wgpu::PowerPreference, webgl: bool)
     -> Result<(Gpu, wgpu::Surface<'static>), String> {
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = backends;
     let instance = wgpu::Instance::new(descriptor);
     let surface = instance.create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone())).map_err(|e| e.to_string())?;
     let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::LowPower, compatible_surface: Some(&surface),
+        power_preference: preference, compatible_surface: Some(&surface),
         force_fallback_adapter: false, apply_limit_buckets: false,
     }).await.map_err(|e| e.to_string())?;
     let required_limits = if webgl {
@@ -407,11 +407,11 @@ async fn try_backend(canvas: &web_sys::HtmlCanvasElement, backends: wgpu::Backen
     Ok((Gpu::from_device(instance, adapter, device, queue), surface))
 }
 
-async fn gpu(canvas: web_sys::HtmlCanvasElement, features: wgpu::Features) -> Result<(Gpu, wgpu::Surface<'static>), String> {
-    match try_backend(&canvas, wgpu::Backends::BROWSER_WEBGPU, features, false).await {
+async fn gpu(canvas: web_sys::HtmlCanvasElement, features: wgpu::Features, preference: wgpu::PowerPreference) -> Result<(Gpu, wgpu::Surface<'static>), String> {
+    match try_backend(&canvas, wgpu::Backends::BROWSER_WEBGPU, features, preference, false).await {
         Ok(pair) => Ok(pair),
         #[cfg(feature = "webgl")]
-        Err(webgpu_err) => try_backend(&canvas, wgpu::Backends::GL, features, true)
+        Err(webgpu_err) => try_backend(&canvas, wgpu::Backends::GL, features, preference, true)
             .await
             .map_err(|gl_err| format!("WebGPU ({webgpu_err}) and WebGL2 ({gl_err}) unavailable")),
         #[cfg(not(feature = "webgl"))]
@@ -611,6 +611,10 @@ impl<S: 'static> Browser<S> {
         }
         let mut running = self.running.borrow_mut();
         let Some(r) = &mut *running else { return false };
+        // A browser can select a GPU that cannot share a canvas texture with the compositor.
+        // While the CPU still presents, give the other power preference one chance.
+        let retry = matches!(&r.draw, Draw::HandingOver { side, .. } if !side.gl)
+            && self.gpu_attempt == Some(wgpu::PowerPreference::None);
         let side = match std::mem::replace(&mut r.draw, Draw::Moving) {
             Draw::Gpu(side) => match canvas.as_ref().and_then(cpu_canvas::CpuCanvas::under) {
                 Some(cpu) => { r.draw = Draw::Cpu { cpu, failed: true }; side }
@@ -623,16 +627,19 @@ impl<S: 'static> Browser<S> {
                 }
             },
             // Mid hand-over: the CPU's canvas is still up, and stays.
-            Draw::HandingOver { cpu, side, .. } => { r.draw = Draw::Cpu { cpu, failed: true }; side }
+            Draw::HandingOver { cpu, side, .. } => { r.draw = Draw::Cpu { cpu, failed: !retry }; side }
             other => { r.draw = other; return false; }
         };
         web_sys::console::warn_1(&format!("rune: the GPU device was lost ({why}); the page draws on the CPU").into());
         crate::marks::mark("web.gpu.lost");
         side.gpu.device.destroy();
+        drop(side);
         crate::render::cpu_boot::attach_text(&mut r.rt.text.atlas);
         r.rt.text.atlas.refill_gpu_masks();
         if let Some(c) = &canvas { let _ = c.style().set_property("opacity", "0"); }
         window.request_redraw();
+        drop(running);
+        if retry { self.ask_gpu(wgpu::PowerPreference::HighPerformance); }
         false
     }
 
@@ -829,11 +836,9 @@ impl<S: 'static> Browser<S> {
         if let Some(window) = &self.window { window.request_redraw(); }
     }
 
-    /// Asks the browser for the GPU, once.
-    fn ask_gpu(&mut self) {
-        if self.gpu_asked || self.start == Start::CpuOnly { return; }
+    fn ask_gpu(&mut self, preference: wgpu::PowerPreference) {
         let Some(canvas) = self.window.as_ref().and_then(|w| w.canvas()) else { return };
-        self.gpu_asked = true;
+        self.gpu_attempt = Some(preference);
         crate::marks::mark("web.gpu.asked");
         // A page that started on the CPU asks after its first frame, when the running app holds the compositor.
         let features = match self.app.as_ref().and_then(|a| a.compositor.as_ref()) {
@@ -845,7 +850,7 @@ impl<S: 'static> Browser<S> {
         let canvas_now = self.running.borrow().as_ref().map(|r| (r.size, r.rt.srgb_blend()));
         let (pending, warmed, proxy) = (self.pending.clone(), self.warmed.clone(), self.proxy.clone());
         wasm_bindgen_futures::spawn_local(async move {
-            let result = gpu(canvas, features).await;
+            let result = gpu(canvas, features, preference).await;
             crate::marks::mark("web.gpu.answered");
             let format = result.as_ref().ok().zip(canvas_now).and_then(|((gpu, surface), (size, srgb))| canvas_config(gpu, surface, size, srgb)).map(|(_, format)| format);
             if let (Ok((gpu, _)), Some(format)) = (&result, format) && let Some(w) = pipelines::warm(&gpu.device, format).await {
@@ -869,10 +874,12 @@ impl<S: 'static> Browser<S> {
     /// pipelines asynchronously is asked at the first look: its pipelines build off the thread
     /// that presents the CPU's frames (`pipelines::warm`), so nothing waits for quiet.
     fn maybe_start_gpu(&mut self) {
-        if self.gpu_asked || self.start != Start::CpuFirst { return; }
+        if self.gpu_attempt.is_some() || self.start != Start::CpuFirst { return; }
         let Some(first) = self.first_at else { return };
         let quiet = self.drawn_at.is_none_or(|at| at.elapsed() >= QUIET);
-        if quiet || first.elapsed() >= QUIET_LIMIT || pipelines::browser_compiles_async() { return self.ask_gpu(); }
+        if quiet || first.elapsed() >= QUIET_LIMIT || pipelines::browser_compiles_async() {
+            return self.ask_gpu(wgpu::PowerPreference::None);
+        }
         let proxy = self.proxy.clone();
         after(QUIET, move || { let _ = proxy.send_event(Wake::StartGpu); });
     }
@@ -1107,7 +1114,7 @@ impl<S: 'static> ApplicationHandler<Wake> for Browser<S> {
         // A page that starts on the CPU asks for the GPU once its first frames are up and it's
         // quiet (`maybe_start_gpu`): asked at once, the browser's GPU process makes the adapter
         // and compiles the renderer's pipelines while the first frame waits on it to show.
-        if self.start == Start::GpuFirst { self.ask_gpu(); }
+        if self.start == Start::GpuFirst { self.ask_gpu(wgpu::PowerPreference::None); }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Wake) {
