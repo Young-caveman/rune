@@ -431,6 +431,7 @@ fn gpu_side<S: 'static>(gpu: Gpu, surface: wgpu::Surface<'static>, size: (u32, u
     health::watch(&gpu.device, lost);
     let mut renderer = Renderer::new(&gpu.device, format);
     renderer.set_srgb_blend(!format.is_srgb());
+    rt.text.atlas.invalidate();
     renderer.attach_text(&mut rt.text.atlas);
     let gl = gpu.adapter.get_info().backend == wgpu::Backend::Gl;
     Ok(GpuSide { gpu, surface, config, renderer, gl })
